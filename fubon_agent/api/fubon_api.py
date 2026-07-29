@@ -921,26 +921,109 @@ class OrderAgent(OrderAgentBase):
                     return [dict(api="MayDay", success=False, result=str(e))]
                 retry += 1
 
-    def _buy_futures(self, product, price, qty=1):
+    def _position_matches_product(self, position, product, converted=None) -> bool:
+        position_product = getattr(
+            position, "symbol", getattr(position, "stock_no", None)
+        )
+        if position_product is None:
+            # Product-scoped queries may omit symbol; treat as match.
+            return True
+        if converted is None:
+            converted = self._convert_symbol(product)
+        return position_product in (product, converted)
+
+    def _count_exist_buy_qty(self, product, positions) -> int:
+        """Sum existing long qty for product (positions only, not working orders)."""
+        converted = self._convert_symbol(product)
+        total = 0
+        for position in positions or []:
+            if not self._position_matches_product(position, product, converted):
+                continue
+            direction = getattr(
+                position, "buy_sell", getattr(position, "direction", None)
+            )
+            if direction != BSAction.Buy:
+                continue
+            total += int(
+                getattr(position, "lot", getattr(position, "quantity", 0)) or 0
+            )
+        return total
+
+    def _max_qty_noop_result(self, exist_buy_qty, max_qty):
+        return dict(
+            api="Buy",
+            success=True,
+            result=f"No-op: exist_buy_qty={exist_buy_qty} >= max_qty={max_qty}",
+        )
+
+    def _buy_futures(self, product, price, qty=1, max_qty=0):
+        """Open (or flip to) long. When max_qty > 0, final long is capped.
+
+        e.g. exist_buy=3, qty=3, max_qty=5 => place 2 (final long 5).
+        Omit max_qty / 0 keeps previous uncapped BUY behavior
+        (etensword-agent a5009bd / d45a159).
+
+        Important (d45a159): if already at/over max_qty, return no-op *before*
+        canceling working orders or closing shorts — leave the book untouched.
+        """
+        logger.info(
+            f"[{self.trace_id}] _buy_futures > product: {product}, price: {price}, "
+            f"qty: {qty}, max_qty: {max_qty}"
+        )
         result = []
         response, trades, positions = self._has_open_interest(product)
         result.append(response)
         if not response["success"]:
             return result
 
+        # Count existing long first. If already at/over max_qty, do nothing
+        # (no cancel of working orders, no close short, no open).
+        exist_buy_qty = self._count_exist_buy_qty(product, positions)
+        if max_qty and max_qty > 0 and exist_buy_qty >= max_qty:
+            logger.info(
+                f"[{self.trace_id}] _buy_futures > no-op: "
+                f"exist_buy_qty={exist_buy_qty} >= max_qty={max_qty} "
+                f"(leave existing orders/positions untouched)"
+            )
+            result.append(self._max_qty_noop_result(exist_buy_qty, max_qty))
+            return result
+
+        # Only cancel working orders when we still need to act under max_qty.
         if trades:
             self._cancel_ongoing_trades(trades)
             response, trades, positions = self._has_open_interest(product)
             result.append(response)
+            # Re-count after cancel/refresh in case positions changed.
+            exist_buy_qty = self._count_exist_buy_qty(product, positions)
+            if max_qty and max_qty > 0 and exist_buy_qty >= max_qty:
+                logger.info(
+                    f"[{self.trace_id}] _buy_futures > no-op after refresh: "
+                    f"exist_buy_qty={exist_buy_qty} >= max_qty={max_qty}"
+                )
+                result.append(self._max_qty_noop_result(exist_buy_qty, max_qty))
+                return result
 
+        # Close existing shorts first.
         close_orders = []
-        for position in positions:
-            direction = getattr(position, "buy_sell", getattr(position, "direction", None))
+        converted = self._convert_symbol(product)
+        for position in positions or []:
+            if not self._position_matches_product(position, product, converted):
+                continue
+            direction = getattr(
+                position, "buy_sell", getattr(position, "direction", None)
+            )
             if direction != BSAction.Sell:
                 continue
-            qty_to_close = getattr(position, "lot", getattr(position, "quantity", 0))
-            for batch_qty in _iter_batches(qty_to_close):
-                order_response = self._place_order(product=product, buy_sell=ORDER_TYPE_BUY, price=price, qty=batch_qty)
+            position_qty = int(
+                getattr(position, "lot", getattr(position, "quantity", 0)) or 0
+            )
+            for batch_qty in _iter_batches(position_qty):
+                order_response = self._place_order(
+                    product=product,
+                    buy_sell=ORDER_TYPE_BUY,
+                    price=price,
+                    qty=batch_qty,
+                )
                 result.append(order_response)
                 close_orders.append(order_response)
                 if not order_response["success"]:
@@ -949,33 +1032,73 @@ class OrderAgent(OrderAgentBase):
         for order_response in close_orders:
             self._check_order_info(product, None, order_response.get("order_id"))
 
+        # Cap open qty so final long does not exceed max_qty when set.
+        # Early no-op above already handled room <= 0.
+        target_qty = int(qty)
+        if max_qty and max_qty > 0:
+            room = int(max_qty) - exist_buy_qty
+            target_qty = min(target_qty, max(room, 0))
+            logger.info(
+                f"[{self.trace_id}] _buy_futures > max_qty cap: "
+                f"exist_buy_qty={exist_buy_qty}, qty={qty}, max_qty={max_qty}, "
+                f"place_qty={target_qty}"
+            )
+
         buy_orders = []
-        for batch_qty in _iter_batches(qty):
-            order_response = self._place_order(product=product, buy_sell=ORDER_TYPE_BUY, price=price, qty=batch_qty)
+        for batch_qty in _iter_batches(target_qty):
+            order_response = self._place_order(
+                product=product, buy_sell=ORDER_TYPE_BUY, price=price, qty=batch_qty
+            )
             result.append(order_response)
             buy_orders.append(order_response)
             if not order_response["success"]:
                 return result
 
         for order_response in buy_orders:
-            result.append(self._check_order_info(product, BSAction.Buy, order_response.get("order_id")))
+            result.append(
+                self._check_order_info(
+                    product, BSAction.Buy, order_response.get("order_id")
+                )
+            )
         return result
 
-    def Buy(self, product, price, qty=1):
+    def Buy(self, product, price, qty=1, max_qty=0):
         retry = 0
         while True:
+            logger.info(
+                f"[{self.trace_id}] Buy > product: {product}, price: {price}, "
+                f"qty: {qty}, max_qty: {max_qty}"
+            )
             if product.isnumeric():
-                return [dict(api="Buy", success=False, result="Stock Buy is not implemented yet (TODO)")]
+                return [
+                    dict(
+                        api="Buy",
+                        success=False,
+                        result="Stock Buy is not implemented yet (TODO)",
+                    )
+                ]
             if qty < 1:
                 return [dict(api="Buy", success=False, result=f"Invalid qty: {qty}")]
             try:
-                return self._buy_futures(product, price, qty)
+                return self._buy_futures(product, price, qty, max_qty=max_qty)
             except NotEnoughMoneyError:
                 qty -= 1
+                retry += 1
+                logger.info(
+                    f"[{self.trace_id}] Buy start retry {retry} with new qty:{qty}"
+                )
                 if qty < 1:
-                    return [dict(api="Buy", success=False, result="NotEnoughMoneyError after retry")]
+                    return [
+                        dict(
+                            api="Buy",
+                            success=False,
+                            result="NotEnoughMoneyError after retry",
+                        )
+                    ]
             except NeedRetryError:
-                return [dict(api="Buy", success=False, result="Order is not completed yet")]
+                return [
+                    dict(api="Buy", success=False, result="Order is not completed yet")
+                ]
 
     def _close_and_buy_futures(self, product, price, qty=1):
         response, trades, positions = self._has_open_interest(product)

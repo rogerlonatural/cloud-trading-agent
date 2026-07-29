@@ -85,6 +85,164 @@ class TestOrderBatching(unittest.TestCase):
         self.assertEqual(agent._has_open_interest.call_args_list[1].args[0], "TXF202404")
 
 
+class TestBuyMaxQty(unittest.TestCase):
+    """Pure BUY props.max_qty (etensword-agent a5009bd + d45a159)."""
+
+    def test_buy_without_max_qty_places_full_qty(self):
+        agent = make_agent()
+        agent._has_open_interest = MagicMock(
+            return_value=(dict(api="list_positions", success=True, result="[]"), [], [])
+        )
+        agent._check_order_info = MagicMock(
+            return_value=dict(api="check_order_info", success=True, result="{}")
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        agent._buy_futures("TXF", price=100, qty=3, max_qty=0)
+
+        self.assertEqual(agent.sdk.futopt.place_order.call_count, 1)
+        self.assertEqual(agent.sdk.futopt.place_order.call_args.args[1].lot, 3)
+
+    def test_buy_max_qty_caps_open_size_given_existing_long(self):
+        # exist_buy=3, qty=3, max_qty=5 => place 2
+        agent = make_agent()
+        existing = MagicMock(symbol="TXF", buy_sell=BSAction.Buy, lot=3)
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [],
+                [existing],
+            )
+        )
+        agent._check_order_info = MagicMock(
+            return_value=dict(api="check_order_info", success=True, result="{}")
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        agent._buy_futures("TXF", price=100, qty=3, max_qty=5)
+
+        self.assertEqual(agent.sdk.futopt.place_order.call_count, 1)
+        self.assertEqual(agent.sdk.futopt.place_order.call_args.args[1].lot, 2)
+
+    def test_buy_max_qty_noop_when_already_at_cap(self):
+        agent = make_agent()
+        existing = MagicMock(symbol="TXF", buy_sell=BSAction.Buy, lot=5)
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [],
+                [existing],
+            )
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        results = agent._buy_futures("TXF", price=100, qty=3, max_qty=5)
+
+        agent.sdk.futopt.place_order.assert_not_called()
+        noop = [r for r in results if r.get("api") == "Buy"]
+        self.assertEqual(len(noop), 1)
+        self.assertTrue(noop[0]["success"])
+        self.assertIn("No-op", noop[0]["result"])
+
+    def test_buy_max_qty_noop_leaves_existing_working_orders_untouched(self):
+        """d45a159: at max_qty must not cancel working orders."""
+        agent = make_agent()
+        existing = MagicMock(symbol="TXF", buy_sell=BSAction.Buy, lot=5)
+        working_trade = MagicMock(
+            symbol="TXF", buy_sell=BSAction.Buy, lot=1, order_no="open-1", status="10"
+        )
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [working_trade],
+                [existing],
+            )
+        )
+        agent._cancel_ongoing_trades = MagicMock()
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        results = agent._buy_futures("TXF", price=100, qty=2, max_qty=5)
+
+        agent._cancel_ongoing_trades.assert_not_called()
+        agent.sdk.futopt.place_order.assert_not_called()
+        agent.sdk.futopt.cancel_order.assert_not_called()
+        noop = [r for r in results if r.get("api") == "Buy"]
+        self.assertTrue(noop[0]["success"])
+        self.assertIn("No-op", noop[0]["result"])
+
+    def test_buy_max_qty_noop_after_refresh_if_long_reaches_cap(self):
+        """After cancel/refresh, re-check max_qty before close/open."""
+        agent = make_agent()
+        # First snapshot: long=4, working trade present → cancel allowed
+        # Refresh: long already 5 → no-op, no open
+        long_under = MagicMock(symbol="TXF", buy_sell=BSAction.Buy, lot=4)
+        long_at_cap = MagicMock(symbol="TXF", buy_sell=BSAction.Buy, lot=5)
+        working = MagicMock(symbol="TXF", order_no="w1", status="10")
+        agent._has_open_interest = MagicMock(
+            side_effect=[
+                (
+                    dict(api="list_positions", success=True, result="[]"),
+                    [working],
+                    [long_under],
+                ),
+                (
+                    dict(api="list_positions", success=True, result="[]"),
+                    [],
+                    [long_at_cap],
+                ),
+            ]
+        )
+        agent._cancel_ongoing_trades = MagicMock()
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        results = agent._buy_futures("TXF", price=100, qty=3, max_qty=5)
+
+        agent._cancel_ongoing_trades.assert_called_once()
+        agent.sdk.futopt.place_order.assert_not_called()
+        noop = [r for r in results if r.get("api") == "Buy"]
+        self.assertEqual(len(noop), 1)
+        self.assertIn("No-op", noop[0]["result"])
+
+    def test_buy_max_qty_still_closes_shorts_before_cap(self):
+        agent = make_agent()
+        short = MagicMock(symbol="TXF", buy_sell=BSAction.Sell, lot=2)
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [],
+                [short],
+            )
+        )
+        agent._check_order_info = MagicMock(
+            return_value=dict(api="check_order_info", success=True, result="{}")
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        # no existing long, max_qty=5, qty=4 => close 2 + open 4
+        agent._buy_futures("TXF", price=100, qty=4, max_qty=5)
+
+        lots = [c.args[1].lot for c in agent.sdk.futopt.place_order.call_args_list]
+        self.assertEqual(lots, [2, 4])
+
+    def test_buy_dispatch_passes_max_qty(self):
+        agent = make_agent()
+        with patch.object(agent, "_buy_futures", return_value=[]) as mock_buy:
+            agent.Buy("TXF", price=100, qty=2, max_qty=7)
+            mock_buy.assert_called_once_with("TXF", 100, 2, max_qty=7)
+
+
 class TestPriceChasingRetry(unittest.TestCase):
     def test_close_and_buy_chases_price_up_on_retry_then_succeeds(self):
         agent = make_agent()

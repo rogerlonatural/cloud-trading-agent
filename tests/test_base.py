@@ -11,6 +11,7 @@ class FakeOrderAgent(OrderAgentBase):
     def __init__(self):
         super().__init__(config={"order_agent": {"agent_id": "test-agent"}})
         self.init_called_with = None
+        self.buy_calls = []
 
     def InitAgent(self, agent_id):
         self.init_called_with = agent_id
@@ -20,6 +21,12 @@ class FakeOrderAgent(OrderAgentBase):
 
     def MayDay(self, product, price=None):
         return [dict(api="MayDay", success=True, result=product)]
+
+    def Buy(self, product, price, qty=1, max_qty=0):
+        self.buy_calls.append(
+            dict(product=product, price=price, qty=qty, max_qty=max_qty)
+        )
+        return [dict(api="Buy", success=True, result="ok")]
 
 
 def make_payload(command, **overrides):
@@ -60,6 +67,27 @@ class TestCommandDispatch(unittest.TestCase):
         result = self.agent.run(payload)
         self.assertEqual(self.agent.init_called_with, "test-agent")
         self.assertTrue(result[0]["success"])
+
+    def test_buy_passes_max_qty_from_props(self):
+        payload = make_payload(
+            AgentCommand.BUY,
+            props={"product": "TXF", "price": 100, "qty": 3, "max_qty": 5},
+        )
+        result = self.agent.run(payload)
+        self.assertTrue(result[0]["success"])
+        self.assertEqual(len(self.agent.buy_calls), 1)
+        self.assertEqual(
+            self.agent.buy_calls[0],
+            dict(product="TXF", price=100, qty=3, max_qty=5),
+        )
+
+    def test_buy_defaults_max_qty_to_zero_when_omitted(self):
+        payload = make_payload(
+            AgentCommand.BUY,
+            props={"product": "TXF", "price": 100, "qty": 2},
+        )
+        self.agent.run(payload)
+        self.assertEqual(self.agent.buy_calls[0]["max_qty"], 0)
 
 
 class TestProcessOrderDedup(unittest.TestCase):

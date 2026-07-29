@@ -55,6 +55,13 @@ class OrderAgentBase(object):
             product = props["product"]
             price = props["price"] if "price" in props else None
             qty = props["qty"] if "qty" in props else 0
+            # Cap pure BUY so final long never exceeds max_qty when set
+            # (etensword-agent a5009bd). Omit / 0 => previous uncapped BUY.
+            max_qty = (
+                int(props["max_qty"])
+                if props.get("max_qty") not in (None, "")
+                else 0
+            )
 
             if command == AgentCommand.CHECK_OPEN_INTEREST:
                 return self.HasOpenInterest(product)
@@ -72,7 +79,7 @@ class OrderAgentBase(object):
                 return self.Sell(product, price, qty)
 
             if command == AgentCommand.BUY:
-                return self.Buy(product, price, qty)
+                return self.Buy(product, price, qty, max_qty=max_qty)
 
         except Exception:
             msg = "Failed to execute command %s. Error: %s" % (
@@ -106,7 +113,7 @@ class OrderAgentBase(object):
     def Sell(self, product, price, qty=1):
         raise NotImplementedError()
 
-    def Buy(self, product, price, qty=1):
+    def Buy(self, product, price, qty=1, max_qty=0):
         raise NotImplementedError()
 
     def InitAgent(self, agent_id):
