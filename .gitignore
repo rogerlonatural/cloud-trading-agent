@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# secrets / certs — never commit
+.cert/
+.sdk/
+*.pfx
+*.whl
+settings.yaml
+!config/agent_settings.yaml
+
+*.log
+log/
+.pytest_cache/
+
+# Large third-party doc dumps (can trip secret scanners)
+llms-full.md

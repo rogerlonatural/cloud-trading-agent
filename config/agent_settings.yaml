@@ -1,0 +1,31 @@
+order_agent:
+  order_agent_type: fubon_api
+  agent_id: <unique id>
+
+fubon_api:
+  person_id: <Fubon login ID>
+  password: <Fubon login password>
+  cert_path: <path to .pfx cert>
+  cert_password: <cert password>
+  # Runtime login uses API Key by default (SDK >= v2.2.7).
+  # password above is only for first-time 連線測試 / account activation.
+  api_key: <Fubon API Key secret>
+  # api_key_path: .cert/api-key.txt
+  # apikey (default, production) | password (activation only)
+  login_method: apikey
+  is_dry_run: false
+
+agent_account_mapping:
+  <agent_id_1>: <account_id_1>
+  <agent_id_2>: <account_id_2>
+
+gcp:
+  project_id: EtenSword
+  topic: FuturesBot
+  topic_feedback: FuturesAgent
+  subscription: <subscription name>
+  google_application_credentials: <path to service account json>
+
+logging:
+  log_file_path: <path>FubonAgent-{date}.log
+  log_level: INFO

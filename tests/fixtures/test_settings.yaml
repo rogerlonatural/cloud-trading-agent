@@ -1,0 +1,25 @@
+order_agent:
+  order_agent_type: fubon_api
+  agent_id: test-agent
+
+fubon_api:
+  person_id: A123456789
+  password: test-password
+  cert_path: /tmp/test.pfx
+  cert_password: test-cert-password
+  api_key: TEST_API_KEY_VALUE
+  login_method: apikey
+  is_dry_run: true
+
+agent_account_mapping:
+  test-agent: "0000001"
+  other-agent: "0000002"
+
+gcp:
+  project_id: test-project
+  topic: FuturesBot
+  topic_feedback: FuturesAgent
+  subscription: test-subscription
+
+logging:
+  log_level: INFO
