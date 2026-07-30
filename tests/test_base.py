@@ -1,10 +1,18 @@
+import json
 import time
 import unittest
+from enum import Enum
 from unittest.mock import patch
 
 from fubon_agent.agent_commands import AgentCommand
 from fubon_agent.api import base as base_module
-from fubon_agent.api.base import OrderAgentBase, process_order
+from fubon_agent.api.base import (
+    OrderAgentBase,
+    feedback_execution_result,
+    format_inline,
+    process_order,
+    to_jsonable,
+)
 
 
 class FakeOrderAgent(OrderAgentBase):
@@ -121,6 +129,73 @@ class TestProcessOrderDedup(unittest.TestCase):
         result = process_order(agent, payload)
         self.assertFalse(result)
         mock_post.assert_not_called()
+
+
+class _FakeSide(Enum):
+    Buy = "Buy"
+    Sell = "Sell"
+
+
+class FakeFilledData:
+    """Mimics multi-line Fubon FilledData (not JSON-serializable via default)."""
+
+    def __init__(self):
+        self.stock_no = "2501"
+        self.order_no = "o4616"
+        self.filled_qty = 1000
+        self.filled_price = 22.15
+        self.buy_sell = _FakeSide.Sell
+        self.account = "71247"
+
+    def __str__(self):
+        return (
+            "FilledData {\n"
+            "    stock_no: \"2501\",\n"
+            "    order_no: \"o4616\",\n"
+            "    filled_qty: 1000,\n"
+            "}"
+        )
+
+
+class TestSdkModelLogging(unittest.TestCase):
+    def test_to_jsonable_walks_public_attrs(self):
+        plain = to_jsonable(FakeFilledData())
+        self.assertEqual(plain["stock_no"], "2501")
+        self.assertEqual(plain["filled_qty"], 1000)
+        self.assertEqual(plain["buy_sell"], "Sell")
+        self.assertEqual(plain["_type"], "FakeFilledData")
+
+    def test_format_inline_is_single_line_json(self):
+        line = format_inline(FakeFilledData())
+        self.assertNotIn("\n", line)
+        parsed = json.loads(line)
+        self.assertEqual(parsed["order_no"], "o4616")
+
+    def test_format_inline_collapses_multiline_str_fallback(self):
+        class Weird:
+            def __str__(self):
+                return "OrderResult {\n    status: 10,\n}"
+
+        line = format_inline(Weird())
+        self.assertNotIn("\n", line)
+        self.assertIn("OrderResult", line)
+
+    @patch("fubon_agent.api.base.requests.post")
+    def test_feedback_serializes_sdk_filled_data(self, mock_post):
+        mock_post.return_value.status_code = 204
+        mock_post.return_value.text = ""
+        feedback_execution_result(
+            "agent-1",
+            AgentCommand.DEAL_CALLBACK,
+            "cmd-filled-1",
+            FakeFilledData(),
+        )
+        mock_post.assert_called_once()
+        body = json.loads(mock_post.call_args.kwargs["data"])
+        # Nested execution_result is a JSON string of the plain dict
+        exec_result = json.loads(body["message"]["execution_result"])
+        self.assertEqual(exec_result["stock_no"], "2501")
+        self.assertEqual(exec_result["buy_sell"], "Sell")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from fubon_agent.api.base import (
     NotEnoughMoneyError,
     logger,
     feedback_execution_result,
+    format_inline,
     AgentCommand,
 )
 
@@ -445,20 +446,130 @@ class OrderAgent(OrderAgentBase):
 
     # Callback payload shape: official reconnect sample uses on_event(code, content);
     # some call paths may pass a dict body. Accept both.
+
+    @staticmethod
+    def _callback_field(content, *names):
+        """Read first non-empty field from a dict or SDK model."""
+        if content is None:
+            return None
+        for name in names:
+            if isinstance(content, dict):
+                val = content.get(name)
+            else:
+                val = getattr(content, name, None)
+            if val not in (None, ""):
+                return val
+        return None
+
+    def _configured_account_ids(self) -> set:
+        """Futures account numbers this agent is allowed to act on."""
+        ids = set()
+        if getattr(self, "account_id", None):
+            ids.add(str(self.account_id).strip())
+        for val in (getattr(self, "agent_account_mapping", None) or {}).values():
+            if val is not None and str(val).strip():
+                ids.add(str(val).strip())
+        return ids
+
+    def _callback_looks_like_stock(self, content) -> bool:
+        """Detect stock OrderResult/FilledData (this agent is futures-only)."""
+        order_type = str(self._callback_field(content, "order_type") or "")
+        # e.g. "Stock", "OrderType.Stock"
+        if "Stock" in order_type and "Fut" not in order_type:
+            return True
+        stock_no = self._callback_field(content, "stock_no")
+        if stock_no is not None and str(stock_no).strip().isdigit():
+            return True
+        market_type = str(self._callback_field(content, "market_type") or "")
+        symbol = self._callback_field(content, "symbol", "order_symbol")
+        # Common = cash equity market on Fubon stock path
+        if market_type in ("Common", "Stock", "MarketType.Common") and not symbol:
+            return True
+        return False
+
+    def _callback_looks_like_futures(self, content) -> bool:
+        order_type = str(self._callback_field(content, "order_type") or "")
+        if any(tok in order_type for tok in ("FutOpt", "Future", "Futures", "Option")):
+            return True
+        market_type = str(self._callback_field(content, "market_type") or "")
+        if any(tok in market_type for tok in ("FutOpt", "Future", "Futures", "Option")):
+            return True
+        symbol = str(
+            self._callback_field(content, "symbol", "order_symbol", "stock_no") or ""
+        ).upper()
+        roots = tuple(ACCOUNTING_SYMBOL_BY_ROOT.keys()) + tuple(
+            ACCOUNTING_SYMBOL_BY_ROOT.values()
+        )
+        return any(symbol.startswith(root) for root in roots)
+
+    def _should_handle_trade_callback(self, content) -> bool:
+        """Only handle fills/orders for our futures account + futures market.
+
+        Fubon login is person-level: stock account events (other account numbers
+        / order_type=Stock) arrive on the same session and must not trigger
+        DEAL_CALLBACK feedback into slash-futures.
+        """
+        if content is None:
+            return False
+        if self._callback_looks_like_stock(content) and not self._callback_looks_like_futures(
+            content
+        ):
+            return False
+        allowed = self._configured_account_ids()
+        acct = str(self._callback_field(content, "account", "account_id") or "").strip()
+        if allowed and acct and acct not in allowed:
+            return False
+        # No account on payload (or agent not InitAgent'd yet): require clear futures.
+        if not acct or not allowed:
+            return self._callback_looks_like_futures(content)
+        return True
+
     def _on_order(self, err, content):
-        logger.info(f"[{self.trace_id}] on_order > err: {err}, content: {content}")
+        # Inline JSON: multi-line OrderResult.__str__ fragments Cloud Logging.
+        logger.info(
+            "[%s] on_order > err: %s, content: %s",
+            self.trace_id,
+            format_inline(err),
+            format_inline(content),
+        )
+        if not self._should_handle_trade_callback(content):
+            logger.info(
+                "[%s] on_order skip (account/market filter)", self.trace_id
+            )
 
     def _on_order_changed(self, err, content):
-        logger.info(f"[{self.trace_id}] on_order_changed > err: {err}, content: {content}")
+        logger.info(
+            "[%s] on_order_changed > err: %s, content: %s",
+            self.trace_id,
+            format_inline(err),
+            format_inline(content),
+        )
+        if not self._should_handle_trade_callback(content):
+            logger.info(
+                "[%s] on_order_changed skip (account/market filter)", self.trace_id
+            )
 
     def _on_filled(self, err, content):
         try:
-            logger.info(f"[{self.trace_id}] on_filled > err: {err}, content: {content}")
+            logger.info(
+                "[%s] on_filled > err: %s, content: %s",
+                self.trace_id,
+                format_inline(err),
+                format_inline(content),
+            )
+            if not self._should_handle_trade_callback(content):
+                logger.info(
+                    "[%s] on_filled skip feedback (account/market filter)",
+                    self.trace_id,
+                )
+                return
             feedback_execution_result(
                 self.agent_id, AgentCommand.DEAL_CALLBACK, self.trace_id, content
             )
         except Exception as e:
-            logger.warning(f"[{self.trace_id}] on_filled error but ignore: {e}")
+            logger.warning(
+                "[%s] on_filled error but ignore: %s", self.trace_id, e
+            )
 
     def _extract_event_code(self, code_or_err, content):
         """Normalize Fubon on_event(code, content) vs dict-shaped payloads."""
@@ -472,8 +583,11 @@ class OrderAgent(OrderAgentBase):
         try:
             code = self._extract_event_code(code_or_err, content)
             logger.info(
-                f"[{self.trace_id}] on_event > code: {code}, "
-                f"content: {content}, raw0: {code_or_err}"
+                "[%s] on_event > code: %s, content: %s, raw0: %s",
+                self.trace_id,
+                format_inline(code),
+                format_inline(content),
+                format_inline(code_or_err),
             )
             if code in DISCONNECT_EVENT_CODES:
                 # Mark dead; actual reconnect runs on ensure_logged_in / API
@@ -485,7 +599,9 @@ class OrderAgent(OrderAgentBase):
                 )
                 self._connected = False
         except Exception as e:
-            logger.warning(f"[{self.trace_id}] on_event handler error but ignore: {e}")
+            logger.warning(
+                "[%s] on_event handler error but ignore: %s", self.trace_id, e
+            )
 
     def _set_account(self, agent_id):
         self.account_id = self.agent_account_mapping[agent_id]
@@ -499,7 +615,11 @@ class OrderAgent(OrderAgentBase):
                 break
         if not self.current_account:
             raise Exception("No account for account_id: %s" % self.account_id)
-        logger.info(f"[{self.trace_id}] Set default account: {self.current_account}")
+        logger.info(
+            "[%s] Set default account: %s",
+            self.trace_id,
+            format_inline(self.current_account),
+        )
 
     def InitAgent(self, agent_id):
         logger.info(f"[{self.trace_id}] InitAgent > agent: {agent_id}")

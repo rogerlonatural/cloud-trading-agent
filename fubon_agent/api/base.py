@@ -1,6 +1,8 @@
+import dataclasses
 import json
 import time
 import traceback
+from enum import Enum
 
 import requests
 
@@ -13,6 +15,81 @@ _config = get_config()
 _cmd_history = {}
 
 FEEDBACK_URL = "https://asia-east2-etensword.cloudfunctions.net/api_send_agent_feedback"
+
+
+def to_jsonable(obj, _depth: int = 0):
+    """Best-effort convert Fubon SDK models (OrderResult, FilledData, …) to
+    JSON-serializable plain data.
+
+    SDK objects are not dataclasses and often only expose a multi-line ``str``;
+    walking public attributes / ``__dict__`` keeps logs and feedback usable.
+    """
+    if _depth > 8:
+        return " ".join(str(obj).split())
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_jsonable(v, _depth + 1) for v in obj]
+    if isinstance(obj, Enum):
+        return obj.value
+    for meth_name in ("to_dict", "dict", "model_dump", "as_dict"):
+        meth = getattr(obj, meth_name, None)
+        if callable(meth):
+            try:
+                return to_jsonable(meth(), _depth + 1)
+            except Exception:
+                pass
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        try:
+            return to_jsonable(dataclasses.asdict(obj), _depth + 1)
+        except Exception:
+            pass
+    data = getattr(obj, "__dict__", None)
+    if isinstance(data, dict) and data:
+        out = {"_type": type(obj).__name__}
+        for key, val in data.items():
+            if str(key).startswith("_"):
+                continue
+            out[str(key)] = to_jsonable(val, _depth + 1)
+        return out
+    # Slotted / C-extension style models: public non-callable attributes.
+    out = {}
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue
+        try:
+            val = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        out[name] = to_jsonable(val, _depth + 1)
+    if out:
+        out["_type"] = type(obj).__name__
+        return out
+    return " ".join(str(obj).split())
+
+
+def format_inline(obj) -> str:
+    """Single-line JSON (or collapsed str) for Cloud Logging readability.
+
+    Multi-line SDK ``__str__`` dumps (OrderResult / FilledData / Account) split
+    into separate log entries and reverse field order in the console — always
+    emit one compact line instead.
+    """
+    try:
+        return json.dumps(
+            to_jsonable(obj),
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except Exception:
+        return " ".join(str(obj).split())
 
 
 class OrderAgentBase(object):
@@ -210,14 +287,26 @@ def _send_agent_feedback(payload, command_id=""):
 
 def feedback_execution_result(agent_id, command, command_id, result):
     try:
-        logger.info(f"[{command_id}] Feedback command result: {result}")
+        # SDK callback payloads (FilledData/OrderResult) are not natively JSON
+        # serializable — convert first so feedback CF + logs do not explode.
+        plain = to_jsonable(result)
+        logger.info(
+            "[%s] Feedback command result: %s", command_id, format_inline(plain)
+        )
         msg_object = {
             "command": command,
-            "message": {"execution_result": json.dumps(result)},
+            "message": {
+                "execution_result": json.dumps(plain, ensure_ascii=False, default=str)
+            },
             "agent": agent_id,
             "command_id": command_id,
         }
         _send_agent_feedback(msg_object, command_id)
     except Exception as e:
-        logger.info(f"[{command_id}] Failed to feedback execution result, ignored", e)
-        pass
+        # Do not pass exception as logger args after an f-string (causes
+        # "--- Logging error ---" on record.getMessage()).
+        logger.info(
+            "[%s] Failed to feedback execution result, ignored: %s",
+            command_id,
+            e,
+        )

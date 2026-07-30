@@ -412,6 +412,73 @@ class TestLoginMethod(unittest.TestCase):
         mock_sdk.set_on_event.assert_called()
 
 
+class TestTradeCallbackFilter(unittest.TestCase):
+    def test_stock_fill_is_filtered_out(self):
+        agent = make_agent()
+        agent.account_id = "617725"
+        agent.agent_account_mapping = {"test-agent": "617725"}
+        stock_fill = MagicMock()
+        stock_fill.account = "71247"
+        stock_fill.order_type = "Stock"
+        stock_fill.stock_no = "2501"
+        stock_fill.symbol = None
+        stock_fill.order_symbol = None
+        stock_fill.market_type = "Common"
+        self.assertFalse(agent._should_handle_trade_callback(stock_fill))
+
+    def test_futures_fill_for_our_account_is_accepted(self):
+        agent = make_agent()
+        agent.account_id = "617725"
+        agent.agent_account_mapping = {"test-agent": "617725"}
+        fut_fill = MagicMock()
+        fut_fill.account = "617725"
+        fut_fill.order_type = "FutOpt"
+        fut_fill.symbol = "TMFH6"
+        fut_fill.stock_no = None
+        fut_fill.market_type = "Future"
+        self.assertTrue(agent._should_handle_trade_callback(fut_fill))
+
+    def test_futures_fill_for_other_account_is_filtered(self):
+        agent = make_agent()
+        agent.account_id = "617725"
+        agent.agent_account_mapping = {"test-agent": "617725"}
+        other = MagicMock()
+        other.account = "999999"
+        other.order_type = "FutOpt"
+        other.symbol = "TXFD4"
+        self.assertFalse(agent._should_handle_trade_callback(other))
+
+    @patch("fubon_agent.api.fubon_api.feedback_execution_result")
+    def test_on_filled_skips_feedback_for_stock(self, mock_fb):
+        agent = make_agent()
+        agent.account_id = "617725"
+        agent.agent_account_mapping = {"test-agent": "617725"}
+        stock_fill = MagicMock()
+        stock_fill.account = "71247"
+        stock_fill.order_type = "Stock"
+        stock_fill.stock_no = "2501"
+        stock_fill.symbol = None
+        stock_fill.order_symbol = None
+        stock_fill.market_type = "Common"
+        agent._on_filled(None, stock_fill)
+        mock_fb.assert_not_called()
+
+    @patch("fubon_agent.api.fubon_api.feedback_execution_result")
+    def test_on_filled_sends_feedback_for_our_futures(self, mock_fb):
+        agent = make_agent()
+        agent.agent_id = "test-agent"
+        agent.account_id = "617725"
+        agent.agent_account_mapping = {"test-agent": "617725"}
+        fut_fill = MagicMock()
+        fut_fill.account = "617725"
+        fut_fill.order_type = "FutOpt"
+        fut_fill.symbol = "TMFH6"
+        fut_fill.stock_no = None
+        fut_fill.market_type = "Future"
+        agent._on_filled(None, fut_fill)
+        mock_fb.assert_called_once()
+
+
 class TestReconnect(unittest.TestCase):
     def test_on_event_disconnect_code_flips_connected_flag(self):
         agent = make_agent()
