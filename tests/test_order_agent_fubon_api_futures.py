@@ -11,6 +11,7 @@ from fubon_agent.api.fubon_api import BSAction, OrderAgent, RateLimiter
 def make_agent():
     agent = OrderAgent()
     agent.sdk = MagicMock()
+    agent.sdk.futopt_accounting = MagicMock()
     agent.current_account = MagicMock()
     agent.accounts = [MagicMock(account="0000001")]
     agent._connected = True
@@ -18,7 +19,16 @@ def make_agent():
     agent.trace_id = "test-trace"
     agent.agent_id = "test-agent"
     agent.is_dry_run = False
-    agent.sdk.futopt.convert_symbol.side_effect = lambda product: product
+    # Default: empty book
+    agent.sdk.futopt_accounting.query_single_position.return_value = MagicMock(
+        is_success=True, data=[]
+    )
+    agent.sdk.futopt_accounting.query_hybrid_position.return_value = MagicMock(
+        is_success=True, data=[]
+    )
+    agent.sdk.futopt.get_order_results.return_value = MagicMock(
+        is_success=True, data=[]
+    )
     return agent
 
 
@@ -40,15 +50,13 @@ class TestOrderBatching(unittest.TestCase):
         placed = [r for r in results if r.get("api") == "place_order"]
         self.assertTrue(all(r["success"] for r in placed))
 
-    def test_place_order_converts_symbol_before_calling_sdk(self):
+    def test_place_order_passes_contract_symbol_through(self):
+        # convert_symbol needs accounting_sym+expiry; full order codes pass through.
         agent = make_agent()
-        agent.sdk.futopt.convert_symbol.side_effect = None
-        agent.sdk.futopt.convert_symbol.return_value = "TXFD4"
         agent.sdk.futopt.place_order.return_value = MagicMock(order_no="ord-1", status="10")
 
-        response = agent._place_order("TXF", "B", price=0, qty=1)
+        response = agent._place_order("TXFD4", "B", price=0, qty=1)
 
-        agent.sdk.futopt.convert_symbol.assert_called_once_with("TXF")
         self.assertTrue(response["success"])
         order_arg = agent.sdk.futopt.place_order.call_args.args[1]
         self.assertEqual(order_arg.symbol, "TXFD4")

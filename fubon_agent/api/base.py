@@ -1,7 +1,6 @@
 import json
 import time
 import traceback
-from importlib import import_module
 
 import requests
 
@@ -123,48 +122,12 @@ class OrderAgentBase(object):
         pass
 
 
-class OrderAgentFactory:
-    """Kept for parity with the reference repo's plug-in point; main.py imports
-    fubon_api.get_or_create_agent directly, matching the reference repo's actual
-    (not aspirational) wiring."""
-
-    @staticmethod
-    def get_order_agent(order_agent_type="fubon_api") -> OrderAgentBase:
-        retry = 0
-        while True:
-            try:
-                order_agent_module = import_module(
-                    "fubon_agent.api.%s" % order_agent_type, "OrderAgent"
-                )
-                order_agent_class = getattr(order_agent_module, "OrderAgent")
-                order_agent = order_agent_class()
-                return order_agent
-
-            except Exception:
-                logger.warning(
-                    "Failed to get order agent %s, retry again" % order_agent_type
-                )
-                retry += 1
-                if retry > 3:
-                    logger.error(
-                        "Failed to get order agent %s after retry" % order_agent_type
-                    )
-                    return None
-                time.sleep(retry)
-
-
 class NeedRetryError(RuntimeError):
     pass
 
 
 class NotEnoughMoneyError(RuntimeError):
     pass
-
-
-def get_order_agent() -> OrderAgentBase:
-    return OrderAgentFactory.get_order_agent(
-        order_agent_type=_config["order_agent"]["order_agent_type"]
-    )
 
 
 def process_order(order_agent: OrderAgentBase, order_payload: dict) -> bool:

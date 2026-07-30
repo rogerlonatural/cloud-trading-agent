@@ -2,6 +2,40 @@ import os
 
 import yaml
 
+# Template / unset markers that must never be forced into GOOGLE_APPLICATION_CREDENTIALS.
+_PLACEHOLDER_CRED_PATHS = frozenset(
+    {
+        "",
+        "<path to service account json>",
+        "<path>",
+        "None",
+        "null",
+    }
+)
+
+
+def _apply_google_application_credentials(config):
+    """Set GOOGLE_APPLICATION_CREDENTIALS only when a real key file exists.
+
+    On Cloud Run, omit the key and use the runtime service account (ADC).
+    Placeholder values from agent_settings.yaml templates must not be applied —
+    they crash worker boot with DefaultCredentialsError.
+    """
+    gcp = config.get("gcp") or {}
+    raw = gcp.get("google_application_credentials")
+    if raw is None:
+        return
+    path = str(raw).strip()
+    if path in _PLACEHOLDER_CRED_PATHS or path.startswith("<"):
+        return
+    if not os.path.isfile(path):
+        print(
+            "WARNING: gcp.google_application_credentials is not an existing file "
+            f"({path!r}); using Application Default Credentials instead."
+        )
+        return
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = path
+
 
 def get_config(argv=None):
     yaml_file = os.getenv("FUBON_AGENT_CONF")
@@ -15,6 +49,5 @@ def get_config(argv=None):
     with open(yaml_file, "r") as f:
         config = yaml.safe_load(f) or {}
 
-    if "gcp" in config and config["gcp"].get("google_application_credentials"):
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = config["gcp"]["google_application_credentials"]
+    _apply_google_application_credentials(config)
     return config

@@ -61,6 +61,14 @@ ORDER_STATUS_FAILED = "90"
 # 300 disconnect, 301 pong timeout, 302 user logout disconnect, 304 API key revoked.
 DISCONNECT_EVENT_CODES = ("300", "301", "302", "304", 300, 301, 302, 304)
 
+# Strategy product root -> Fubon accounting symbol (HybridPosition.symbol).
+# Order symbols (e.g. TXFD4) come from futopt.convert_symbol(acct_sym, expiry).
+ACCOUNTING_SYMBOL_BY_ROOT = {
+    "TXF": "FITX",
+    "MXF": "FIMTX",
+    "TMF": "FITM",  # confirmed live: HybridPosition.symbol=FITM -> TMFH6
+}
+
 _singleton_agent = None
 
 
@@ -121,11 +129,20 @@ def _is_session_dead_error(ex: BaseException) -> bool:
 
 
 def get_or_create_agent() -> "OrderAgent":
+    """Return the process-wide Fubon OrderAgent singleton (login if needed).
+
+    This is the only agent entry point — this repo is Fubon-only (no factory /
+    order_agent_type plug-in).
+    """
     global _singleton_agent
     if _singleton_agent is None:
         _singleton_agent = OrderAgent()
     _singleton_agent.ensure_logged_in()
     return _singleton_agent
+
+
+# Alias used by callers that historically expected get_order_agent().
+get_order_agent = get_or_create_agent
 
 
 def strbool(val) -> bool:
@@ -495,30 +512,115 @@ class OrderAgent(OrderAgentBase):
 
     # -- symbol / margin helpers --------------------------------------------
 
-    def _convert_symbol(self, product):
+    def _unwrap_sdk_list(self, result):
+        """Normalize Fubon Result{is_success,data} or bare list/None to a list."""
+        if result is None:
+            return []
+        is_success = getattr(result, "is_success", None)
+        if is_success is False:
+            raise RuntimeError(
+                f"SDK call failed: message={getattr(result, 'message', None)!r}"
+            )
+        data = getattr(result, "data", result)
+        if data is None:
+            return []
+        if isinstance(data, (list, tuple)):
+            return list(data)
+        return [data]
+
+    def _product_root(self, product: str) -> str:
+        p = str(product or "").upper()
+        for root in ACCOUNTING_SYMBOL_BY_ROOT:
+            if p.startswith(root):
+                return root
+        return p
+
+    def _accounting_symbol_for_product(self, product: str) -> str:
+        root = self._product_root(product)
+        return ACCOUNTING_SYMBOL_BY_ROOT.get(root, root)
+
+    def _convert_symbol(self, product, expiry_date=None, strike_price=None, call_put=None):
+        """Map accounting symbol(+expiry) to order symbol, or pass-through.
+
+        Official API: convert_symbol(symbol, expiry_date, strike_price=None, call_put=None)
+        e.g. convert_symbol("FITX", "202404") -> "TXFD4"
+        Strategy codes like "TXF" alone cannot convert without expiry; return as-is.
+        """
         try:
-            return self.sdk.futopt.convert_symbol(product)
+            if expiry_date is not None:
+                return self.sdk.futopt.convert_symbol(
+                    product, str(expiry_date), strike_price, call_put
+                )
+            # Already looks like an order contract (e.g. TXFD4) — keep as-is.
+            p = str(product)
+            if len(p) > 3 and p[:3].upper() in ACCOUNTING_SYMBOL_BY_ROOT:
+                # TXF / MXF / TMF roots with month suffix
+                if p.upper() not in ACCOUNTING_SYMBOL_BY_ROOT:
+                    return p
+            return p
         except Exception as e:
             logger.warning(
-                f"[{self.trace_id}] convert_symbol failed for {product}, fallback to raw code: {e}"
+                f"[{self.trace_id}] convert_symbol failed for {product}, "
+                f"expiry={expiry_date}, fallback to raw code: {e}"
             )
             return product
 
+    def _position_order_symbol(self, position):
+        """Best-effort order symbol for a HybridPosition/Position row."""
+        sym = getattr(position, "symbol", None)
+        expiry = getattr(position, "expiry_date", None)
+        if sym and expiry not in (None, ""):
+            try:
+                return self.sdk.futopt.convert_symbol(
+                    str(sym),
+                    str(expiry),
+                    getattr(position, "strike_price", None),
+                    getattr(position, "call_put", None),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.trace_id}] position convert_symbol failed "
+                    f"sym={sym} expiry={expiry}: {e}"
+                )
+        return sym
+
+    def _position_qty(self, position) -> int:
+        for attr in ("tradable_lot", "tradable_lots", "orig_lots", "lot", "quantity"):
+            val = getattr(position, attr, None)
+            if val in (None, ""):
+                continue
+            # Skip auto-created unittest.mock children (hasattr is always True).
+            if type(val).__name__ in ("MagicMock", "Mock", "AsyncMock"):
+                continue
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                continue
+        return 0
+
     def _check_margin_sufficient(self, symbol, qty) -> bool:
-        """Proactive margin check (replaces Shioaji's reactive 99Q9/99QB code
-        detection, since Fubon has no confirmed equivalent sub-code -- see
-        plan doc open risks). Best-effort: any lookup failure is treated as
-        "proceed" rather than blocking the order.
+        """Proactive margin check via query_estimate_margin(account, order).
+
+        Best-effort: any lookup failure is treated as "proceed".
         """
         try:
+            order = self._create_futures_order(ORDER_TYPE_BUY, 0, qty, symbol)
             self._rate_limiter.acquire()
-            result = self.sdk.futopt.query_estimate_margin(self.current_account, symbol, qty)
-            sufficient = getattr(result, "is_sufficient", None)
+            result = self.sdk.futopt.query_estimate_margin(
+                self.current_account, order
+            )
+            # Some SDK versions put a flag on the Result; others only return
+            # EstimateMargin data. Treat explicit is_success=False as fail.
+            if getattr(result, "is_success", None) is False:
+                return False
+            data = getattr(result, "data", result)
+            sufficient = getattr(data, "is_sufficient", None)
             if sufficient is False:
                 return False
         except Exception as e:
             logger.warning(
-                f"[{self.trace_id}] query_estimate_margin check failed, proceeding without pre-check: {e}"
+                f"[{self.trace_id}] query_estimate_margin check failed, "
+                f"proceeding without pre-check: {e}"
             )
         return True
 
@@ -532,25 +634,95 @@ class OrderAgent(OrderAgentBase):
 
     # -- position / order queries --------------------------------------------
 
+    def _list_positions(self, product="__ALL__"):
+        """Query positions via futopt_accounting (not futopt.*).
+
+        Docs: sdk.futopt_accounting.query_hybrid_position(account)
+              sdk.futopt_accounting.query_single_position(account)
+        Both return all account positions; we filter by product family client-side.
+        """
+        accounting = self.sdk.futopt_accounting
+        self._rate_limiter.acquire()
+        if product == "__ALL__":
+            raw = accounting.query_hybrid_position(self.current_account)
+        else:
+            # single_position also returns the full book; filter below.
+            raw = accounting.query_single_position(self.current_account)
+        positions = self._unwrap_sdk_list(raw)
+        if product != "__ALL__":
+            positions = [
+                p for p in positions if self._position_matches_product(p, product)
+            ]
+        return positions
+
+    def _list_working_orders(self, product="__ALL__"):
+        self._rate_limiter.acquire()
+        raw = self.sdk.futopt.get_order_results(self.current_account)
+        order_results = self._unwrap_sdk_list(raw)
+        trades = []
+        for o in order_results:
+            status = str(getattr(o, "status", getattr(o, "order_status", "")))
+            if status in (ORDER_STATUS_CANCELLED, ORDER_STATUS_FILLED):
+                continue
+            if product != "__ALL__" and not self._order_matches_product(o, product):
+                continue
+            trades.append(o)
+        return trades
+
+    def _order_matches_product(self, order, product) -> bool:
+        order_sym = str(
+            getattr(order, "symbol", getattr(order, "stock_no", "")) or ""
+        ).upper()
+        if not order_sym:
+            return True
+        product_u = str(product).upper()
+        root = self._product_root(product_u)
+        if order_sym == product_u or order_sym.startswith(root):
+            return True
+        acct = self._accounting_symbol_for_product(product_u)
+        if order_sym == acct or order_sym.startswith(acct):
+            return True
+        return False
+
     def _wrap_list_positions(self, positions, trades) -> str:
         wrap_results = []
         for position in positions:
+            expiry = getattr(position, "expiry_date", None)
             wrap_results.append(
                 dict(
-                    product=getattr(position, "symbol", getattr(position, "stock_no", None)),
-                    action=getattr(position, "buy_sell", getattr(position, "direction", None)),
-                    qty=getattr(position, "lot", getattr(position, "quantity", 0)),
-                    average_price=getattr(position, "price", getattr(position, "avg_price", 0)),
-                    unrealized_profit=getattr(position, "pnl", getattr(position, "unrealized_profit", 0)),
+                    product=getattr(
+                        position, "symbol", getattr(position, "stock_no", None)
+                    ),
+                    expiry_date=expiry,
+                    order_symbol=self._position_order_symbol(position),
+                    action=getattr(
+                        position, "buy_sell", getattr(position, "direction", None)
+                    ),
+                    qty=self._position_qty(position),
+                    average_price=getattr(
+                        position, "price", getattr(position, "avg_price", 0)
+                    ),
+                    unrealized_profit=getattr(
+                        position,
+                        "profit_or_loss",
+                        getattr(
+                            position, "pnl", getattr(position, "unrealized_profit", 0)
+                        ),
+                    ),
+                    market_price=getattr(position, "market_price", None),
                     type="position",
                 )
             )
         for trade in trades:
             wrap_results.append(
                 dict(
-                    product=getattr(trade, "symbol", getattr(trade, "stock_no", None)),
+                    product=getattr(
+                        trade, "symbol", getattr(trade, "stock_no", None)
+                    ),
                     action=getattr(trade, "buy_sell", None),
-                    qty=int(getattr(trade, "lot", getattr(trade, "quantity", 0)) or 0),
+                    qty=int(
+                        getattr(trade, "lot", getattr(trade, "quantity", 0)) or 0
+                    ),
                     average_price=getattr(trade, "price", 0),
                     unrealized_profit=0,
                     type="trade",
@@ -561,7 +733,11 @@ class OrderAgent(OrderAgentBase):
     def _has_open_interest(self, product):
         if not self.current_account:
             return (
-                dict(api="list_positions", success=False, result="Not login yet, account: %s" % self.current_account),
+                dict(
+                    api="list_positions",
+                    success=False,
+                    result="Not login yet, account: %s" % self.current_account,
+                ),
                 None,
                 None,
             )
@@ -569,27 +745,14 @@ class OrderAgent(OrderAgentBase):
         session_reconnects = 0
         while True:
             try:
-                self._rate_limiter.acquire()
-                if product == "__ALL__":
-                    positions = list(self.sdk.futopt.query_hybrid_position(self.current_account) or [])
-                else:
-                    symbol = self._convert_symbol(product)
-                    positions = list(self.sdk.futopt.query_single_position(self.current_account, symbol) or [])
-
-                self._rate_limiter.acquire()
-                order_results = list(self.sdk.futopt.get_order_results(self.current_account) or [])
-                trades = [
-                    o
-                    for o in order_results
-                    if (
-                        product == "__ALL__"
-                        or getattr(o, "symbol", getattr(o, "stock_no", None)) in (product, self._convert_symbol(product))
-                    )
-                    and str(getattr(o, "status", getattr(o, "order_status", "")))
-                    not in (ORDER_STATUS_CANCELLED, ORDER_STATUS_FILLED)
-                ]
+                positions = self._list_positions(product)
+                trades = self._list_working_orders(product)
                 return (
-                    dict(api="list_positions", success=True, result=self._wrap_list_positions(positions, trades)),
+                    dict(
+                        api="list_positions",
+                        success=True,
+                        result=self._wrap_list_positions(positions, trades),
+                    ),
                     trades,
                     positions,
                 )
@@ -614,29 +777,29 @@ class OrderAgent(OrderAgentBase):
                         )
                 if retry > 3:
                     logger.error(
-                        f"[{self.trace_id}] Error after retry _has_open_interest {e}, {traceback.format_exc()}"
+                        f"[{self.trace_id}] Error after retry _has_open_interest {e}, "
+                        f"{traceback.format_exc()}"
                     )
-                    return dict(api="list_positions", success=False, result=str(e)), None, None
+                    return (
+                        dict(api="list_positions", success=False, result=str(e)),
+                        None,
+                        None,
+                    )
                 retry += 1
                 time.sleep(retry * 3)
                 logger.info(f"[{self.trace_id}] _has_open_interest start retry {retry}")
 
     def _get_market_ref_price(self, product):
-        """Best-effort market reference for chase-limit pricing (position last/mark price)."""
+        """Best-effort market reference for chase-limit pricing (position market_price)."""
         try:
             if not self.current_account:
                 return None
-            self._rate_limiter.acquire()
-            symbol = self._convert_symbol(product)
-            positions = list(
-                self.sdk.futopt.query_single_position(self.current_account, symbol) or []
-            )
+            positions = self._list_positions(product)
             for position in positions:
-                # Prefer mark/last fields; do not use entry "price" (avg cost).
                 for attr in (
+                    "market_price",
                     "last_price",
                     "mark_price",
-                    "market_price",
                     "current_price",
                 ):
                     val = getattr(position, attr, None)
@@ -891,7 +1054,7 @@ class OrderAgent(OrderAgentBase):
             if position_product != product and position_product != self._convert_symbol(product):
                 continue
             direction = getattr(position, "buy_sell", getattr(position, "direction", None))
-            qty = getattr(position, "lot", getattr(position, "quantity", 0))
+            qty = self._position_qty(position)
             for batch_qty in _iter_batches(qty):
                 order_response = self._place_order(
                     product=product,
@@ -922,31 +1085,43 @@ class OrderAgent(OrderAgentBase):
                 retry += 1
 
     def _position_matches_product(self, position, product, converted=None) -> bool:
-        position_product = getattr(
-            position, "symbol", getattr(position, "stock_no", None)
-        )
-        if position_product is None:
-            # Product-scoped queries may omit symbol; treat as match.
+        """Match HybridPosition/Position to strategy product (TXF/MXF/TMF/...).
+
+        Accounting uses FITX/FIMTX/FTMX + expiry; order book may use TXFD4.
+        """
+        pos_sym = getattr(position, "symbol", getattr(position, "stock_no", None))
+        if pos_sym is None:
             return True
-        if converted is None:
-            converted = self._convert_symbol(product)
-        return position_product in (product, converted)
+        pos_u = str(pos_sym).upper()
+        product_u = str(product).upper()
+        root = self._product_root(product_u)
+        acct = self._accounting_symbol_for_product(product_u)
+        if pos_u == product_u or pos_u == acct or pos_u.startswith(root):
+            return True
+        if product_u.startswith(pos_u):
+            return True
+        # Optional: converted order symbol from caller
+        if converted and pos_u == str(converted).upper():
+            return True
+        order_sym = self._position_order_symbol(position)
+        if order_sym:
+            ou = str(order_sym).upper()
+            if ou == product_u or ou.startswith(root):
+                return True
+        return False
 
     def _count_exist_buy_qty(self, product, positions) -> int:
         """Sum existing long qty for product (positions only, not working orders)."""
-        converted = self._convert_symbol(product)
         total = 0
         for position in positions or []:
-            if not self._position_matches_product(position, product, converted):
+            if not self._position_matches_product(position, product):
                 continue
             direction = getattr(
                 position, "buy_sell", getattr(position, "direction", None)
             )
             if direction != BSAction.Buy:
                 continue
-            total += int(
-                getattr(position, "lot", getattr(position, "quantity", 0)) or 0
-            )
+            total += self._position_qty(position)
         return total
 
     def _max_qty_noop_result(self, exist_buy_qty, max_qty):
@@ -1005,18 +1180,15 @@ class OrderAgent(OrderAgentBase):
 
         # Close existing shorts first.
         close_orders = []
-        converted = self._convert_symbol(product)
         for position in positions or []:
-            if not self._position_matches_product(position, product, converted):
+            if not self._position_matches_product(position, product):
                 continue
             direction = getattr(
                 position, "buy_sell", getattr(position, "direction", None)
             )
             if direction != BSAction.Sell:
                 continue
-            position_qty = int(
-                getattr(position, "lot", getattr(position, "quantity", 0)) or 0
-            )
+            position_qty = self._position_qty(position)
             for batch_qty in _iter_batches(position_qty):
                 order_response = self._place_order(
                     product=product,
@@ -1117,8 +1289,10 @@ class OrderAgent(OrderAgentBase):
         exist_buy_qty = 0
         orders = []
         for position in positions:
+            if not self._position_matches_product(position, product):
+                continue
             direction = getattr(position, "buy_sell", getattr(position, "direction", None))
-            position_qty = getattr(position, "lot", getattr(position, "quantity", 0))
+            position_qty = self._position_qty(position)
             if direction == BSAction.Sell:
                 for batch_qty in _iter_batches(position_qty):
                     order_response = self._place_order(
@@ -1216,8 +1390,10 @@ class OrderAgent(OrderAgentBase):
         exist_sell_qty = 0
         orders = []
         for position in positions:
+            if not self._position_matches_product(position, product):
+                continue
             direction = getattr(position, "buy_sell", getattr(position, "direction", None))
-            position_qty = getattr(position, "lot", getattr(position, "quantity", 0))
+            position_qty = self._position_qty(position)
             if direction == BSAction.Buy:
                 for batch_qty in _iter_batches(position_qty):
                     order_response = self._place_order(

@@ -1,7 +1,9 @@
-FROM asia-east1-docker.pkg.dev/etensword-order-agent/agents/fubon-agent-app:latest
+FROM asia-east1-docker.pkg.dev/etensword-order-agent/agents/fubon-agent-app:20260730095532
 
+# Trader secrets: agent_settings.yaml + .pfx (+ api-key if used)
 COPY ./.cert/* /app/config/
 
+ENV FUBON_AGENT_CONF=/app/config/agent_settings.yaml
 ENV PORT=8080
 
 # workers=1: single process = single Fubon session.

@@ -1,0 +1,19 @@
+# Source upload for `gcloud builds submit`.
+# Unlike .gitignore, this MUST allow the staged Linux fubon_neo wheel
+# (Dockerfile does COPY fubon_neo-*.whl).
+
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.sdk/
+.cert/
+docker/**/.cert/
+*.log
+log/
+*.egg-info/
+.DS_Store
+llms-full.md
+# Keep fubon_neo-*.whl (explicitly not ignored)

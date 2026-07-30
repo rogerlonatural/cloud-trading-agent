@@ -1,5 +1,4 @@
 order_agent:
-  order_agent_type: fubon_api
   agent_id: <unique id>
 
 fubon_api:
@@ -20,11 +19,13 @@ agent_account_mapping:
   <agent_id_2>: <account_id_2>
 
 gcp:
-  project_id: EtenSword
+  project_id: etensword-order-agent
   topic: FuturesBot
   topic_feedback: FuturesAgent
   subscription: <subscription name>
-  google_application_credentials: <path to service account json>
+  # Leave empty on Cloud Run (uses runtime service account / ADC).
+  # Locally, set to a real service-account JSON path only if needed.
+  google_application_credentials:
 
 logging:
   log_file_path: <path>FubonAgent-{date}.log

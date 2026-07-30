@@ -77,7 +77,6 @@ template:
 
 ```yaml
 order_agent:
-  order_agent_type: fubon_api
   agent_id: <unique id>
 
 fubon_api:
@@ -143,18 +142,17 @@ boundary (`test_order_agent_fubon_api_stocks.py`).
 Deploys to the same GCP projects as `etensword-agent`
 (`etensword-order-agent` for Artifact Registry/Cloud Run,
 `etensword` for Pub/Sub/the feedback Cloud Function/the GCS dedup bucket),
-using the same 3-tier Docker image structure:
+using a 2-tier Docker structure:
 
-1. `docker/agent_base/` — base image (Python slim + the manually-staged
-   `fubon_neo` wheel). Build with `sh docker/agent_base/cloud_build_agent_base.sh`
-   (this pulls the wheel from a private GCS bucket via `gsutil cp` first —
-   see the script for the bucket path).
-2. `docker/agent_app/` — shared app image on top of the base image. Build
-   with `sh docker/agent_app/cloud_build_agent_app.sh [BUILD_VERSION]`.
-3. `docker/<trader>_fubon/` — per-trader image with that trader's
-   `.cert/` baked in. `docker/example_fubon/` is a template — copy it,
-   rename `SERVICE_NAME`, add real `.cert/` contents, and add a line to
-   `deploy_all_agents.sh`. No code changes needed to onboard a new trader.
+1. **App image** (repo-root `Dockerfile`) — `python:3.12-slim-bookworm`
+   (linux/amd64) + Linux `fubon_neo` manylinux wheel + app code. Build with
+   `sh docker/agent_app/cloud_build_agent_app.sh [BUILD_VERSION]` (pulls the
+   wheel from a private GCS bucket into the build context first).
+2. **`docker/<trader>_fubon/`** — per-trader image with that trader's
+   `.cert/` baked in, based on `fubon-agent-app`. `docker/roger_fubon/`
+   is the first trader (and a template for more) — copy it, rename
+   `SERVICE_NAME`, add real `.cert/` contents, and add a line to
+   `deploy_all_agents.sh`.
 
 ```bash
 sh deploy_all_agents.sh

@@ -1,10 +1,11 @@
-# Template for onboarding a new trader: copy this directory to
-# docker/<trader>_fubon/, add its .cert/ (agent_settings.yaml + .pfx),
-# rename SERVICE_NAME below, and add a line to ../../deploy_all_agents.sh.
-# No code changes are needed to onboard a new account.
+#!/usr/bin/env bash
+# Deploy roger's Fubon Cloud Run agent.
+# Requires docker/roger_fubon/.cert/ (agent_settings.yaml + .pfx) before build.
+
+set -euo pipefail
 
 # Accept AGENT_APP_VERSION as parameter, or generate if not provided
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     AGENT_APP_VERSION=$(date '+%Y%m%d%H%M%S')
     echo "No AGENT_APP_VERSION provided, generated: $AGENT_APP_VERSION"
 else
@@ -13,14 +14,20 @@ else
 fi
 
 BUILD_VERSION=$(date '+%Y%m%d%H%M%S')
-echo "example agent BUILD_VERSION: $BUILD_VERSION"
+echo "roger-fubon agent BUILD_VERSION: $BUILD_VERSION"
 
 PROJECT_ID=etensword-order-agent
-SERVICE_NAME=example-fubon
+SERVICE_NAME=roger-fubon
 REGION=asia-northeast1
-WORK_DIR=~/Workspace/cloud-trading-agent/docker/example_fubon/
+WORK_DIR=~/Workspace/cloud-trading-agent/docker/roger_fubon/
 
-cd $WORK_DIR
+cd "$WORK_DIR"
+
+if [ ! -d .cert ] || [ -z "$(ls -A .cert 2>/dev/null || true)" ]; then
+  echo "ERROR: docker/roger_fubon/.cert/ is missing or empty." >&2
+  echo "Copy agent_settings.yaml + .pfx (and api-key if used) into .cert/ before deploy." >&2
+  exit 1
+fi
 
 # Update Dockerfile to use the specified agent-app version
 sed -i.bak "s|FROM asia-east1-docker.pkg.dev/$PROJECT_ID/agents/fubon-agent-app:.*|FROM asia-east1-docker.pkg.dev/$PROJECT_ID/agents/fubon-agent-app:$AGENT_APP_VERSION|" Dockerfile
@@ -30,9 +37,9 @@ echo "Updated Dockerfile to use fubon-agent-app:$AGENT_APP_VERSION"
 gcloud builds submit --timeout=3600 --tag asia-east1-docker.pkg.dev/$PROJECT_ID/agents/$SERVICE_NAME:$BUILD_VERSION
 
 # NOTE:
-#    After first deploy, run scripts/add_cloud_run_permission.sh for this
-#    SERVICE_NAME/REGION so Pub/Sub push can invoke it, then coordinate with
-#    the slash-futures repo owner to add its subscription.
+#    After first deploy, run scripts/add_cloud_run_permission.sh so Pub/Sub
+#    push can invoke this service, then coordinate with the slash-futures repo
+#    owner to add its subscription.
 #  Fubon: max 10 concurrent connections per app. Keep max-instances=1 so
 #  Cloud Run never opens multiple Fubon logins for the same agent service.
 #  min-instances=1 avoids cold-start login stampede at market open.

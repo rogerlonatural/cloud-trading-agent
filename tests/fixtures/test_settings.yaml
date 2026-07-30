@@ -1,5 +1,4 @@
 order_agent:
-  order_agent_type: fubon_api
   agent_id: test-agent
 
 fubon_api:

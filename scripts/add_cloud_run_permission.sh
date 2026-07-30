@@ -4,7 +4,7 @@
 PROJECT_ID=etensword-order-agent
 SERVICE_ACCOUNT=cloud-run-pubsub-invoker@etensword.iam.gserviceaccount.com
 
-SERVICE_NAME=example-fubon
+SERVICE_NAME=roger-fubon
 REGION=asia-northeast1
 
 gcloud run services add-iam-policy-binding $SERVICE_NAME \

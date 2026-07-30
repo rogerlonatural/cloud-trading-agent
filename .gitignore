@@ -8,6 +8,7 @@ venv/
 
 # secrets / certs — never commit
 .cert/
+docker/**/.cert/
 .sdk/
 *.pfx
 *.whl

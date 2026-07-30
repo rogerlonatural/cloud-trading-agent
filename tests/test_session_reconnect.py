@@ -121,9 +121,13 @@ class TestSessionAliveAndEnsureLoggedIn(unittest.TestCase):
                 raise Exception("連線已中斷")
             return []
 
-        agent.sdk.futopt.query_single_position.side_effect = query_side_effect
-        agent.sdk.futopt.get_order_results.return_value = []
-        agent.sdk.futopt.convert_symbol.side_effect = lambda p: p
+        agent.sdk.futopt_accounting = MagicMock()
+        agent.sdk.futopt_accounting.query_single_position.side_effect = (
+            query_side_effect
+        )
+        agent.sdk.futopt.get_order_results.return_value = MagicMock(
+            is_success=True, data=[]
+        )
 
         with patch.object(agent, "reconnect") as mock_re:
 

@@ -1,3 +1,0 @@
-PyYAML==6.0.2
-google-cloud-pubsub==2.28.0
-gunicorn>=23.0.0
