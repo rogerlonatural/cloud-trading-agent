@@ -32,6 +32,62 @@ def make_agent():
     return agent
 
 
+class TestUnwrapSdkList(unittest.TestCase):
+    """Fubon empty-book is_success=False must not hard-fail MayDay/list APIs."""
+
+    def test_unwrap_empty_message_returns_empty_list(self):
+        agent = make_agent()
+        raw = MagicMock(is_success=False, message="查無任何資料", data=None)
+
+        self.assertEqual(agent._unwrap_sdk_list(raw), [])
+
+    def test_unwrap_empty_message_variants(self):
+        agent = make_agent()
+        for msg in ("查無資料", "無資料", "錯誤：查無任何資料"):
+            raw = MagicMock(is_success=False, message=msg, data=None)
+            self.assertEqual(agent._unwrap_sdk_list(raw), [], msg=msg)
+
+    def test_unwrap_real_failure_still_raises(self):
+        agent = make_agent()
+        raw = MagicMock(is_success=False, message="連線逾時", data=None)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            agent._unwrap_sdk_list(raw)
+        self.assertIn("連線逾時", str(ctx.exception))
+
+    def test_list_positions_empty_book_is_success_path(self):
+        """Live 2026-07-31: query_single_position returned 查無任何資料."""
+        agent = make_agent()
+        agent.sdk.futopt_accounting.query_single_position.return_value = MagicMock(
+            is_success=False, message="查無任何資料", data=None
+        )
+        agent.sdk.futopt.get_order_results.return_value = MagicMock(
+            is_success=False, message="查無任何資料", data=None
+        )
+
+        response, trades, positions = agent._has_open_interest("MXFH6")
+
+        self.assertTrue(response["success"])
+        self.assertEqual(positions, [])
+        self.assertEqual(trades, [])
+
+    def test_mayday_empty_book_is_noop_success(self):
+        agent = make_agent()
+        agent.sdk.futopt_accounting.query_single_position.return_value = MagicMock(
+            is_success=False, message="查無任何資料", data=None
+        )
+        agent.sdk.futopt.get_order_results.return_value = MagicMock(
+            is_success=True, data=[]
+        )
+
+        results = agent._mayday_futures("TXFH6")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["api"], "list_positions")
+        self.assertTrue(results[0]["success"])
+        agent.sdk.futopt.place_order.assert_not_called()
+
+
 class TestOrderBatching(unittest.TestCase):
     def test_mayday_splits_large_qty_into_batches_of_20(self):
         agent = make_agent()

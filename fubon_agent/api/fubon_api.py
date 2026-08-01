@@ -70,6 +70,15 @@ ACCOUNTING_SYMBOL_BY_ROOT = {
     "TMF": "FITM",  # confirmed live: HybridPosition.symbol=FITM -> TMFH6
 }
 
+# Fubon often returns is_success=False + these messages for empty query sets
+# (positions / order results) instead of is_success=True with data=[].
+# Treat as empty list, not a hard SDK failure (live 2026-07-31 MAYDAY MXFH6/TXFH6).
+EMPTY_SDK_RESULT_MESSAGES = (
+    "查無任何資料",
+    "查無資料",
+    "無資料",
+)
+
 _singleton_agent = None
 
 
@@ -633,13 +642,25 @@ class OrderAgent(OrderAgentBase):
     # -- symbol / margin helpers --------------------------------------------
 
     def _unwrap_sdk_list(self, result):
-        """Normalize Fubon Result{is_success,data} or bare list/None to a list."""
+        """Normalize Fubon Result{is_success,data} or bare list/None to a list.
+
+        Empty-book messages (e.g. 查無任何資料) are returned as [] even when
+        is_success is False — Fubon uses that pair for no rows, not a transport
+        error. Real failures still raise.
+        """
         if result is None:
             return []
         is_success = getattr(result, "is_success", None)
         if is_success is False:
+            message = getattr(result, "message", None)
+            msg = str(message or "")
+            if any(marker in msg for marker in EMPTY_SDK_RESULT_MESSAGES):
+                logger.info(
+                    f"[{self.trace_id}] SDK empty result treated as []: {message!r}"
+                )
+                return []
             raise RuntimeError(
-                f"SDK call failed: message={getattr(result, 'message', None)!r}"
+                f"SDK call failed: message={message!r}"
             )
         data = getattr(result, "data", result)
         if data is None:
