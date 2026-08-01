@@ -1,4 +1,4 @@
-FROM asia-east1-docker.pkg.dev/etensword-order-agent/agents/fubon-agent-app:20260730095532
+FROM asia-east1-docker.pkg.dev/etensword-order-agent/agents/fubon-agent-app:20260801081945
 
 # Trader secrets: agent_settings.yaml + .pfx (+ api-key if used)
 COPY ./.cert/* /app/config/
