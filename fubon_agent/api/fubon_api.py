@@ -1168,10 +1168,13 @@ class OrderAgent(OrderAgentBase):
         if not positions:
             return results
 
+        # Use _position_matches_product (not raw symbol equality): HybridPosition
+        # uses accounting codes (FITM/FITX/FIMTX) while commands carry order roots
+        # (TMFH6/TXFH6/...). Strict equality silently skips all closes (live incident
+        # 2026-07-31 MAYDAY TMFH6 with FITM positions, success=true, no place_order).
         orders = []
-        for position in positions:
-            position_product = getattr(position, "symbol", getattr(position, "stock_no", None))
-            if position_product != product and position_product != self._convert_symbol(product):
+        for position in positions or []:
+            if not self._position_matches_product(position, product):
                 continue
             direction = getattr(position, "buy_sell", getattr(position, "direction", None))
             qty = self._position_qty(position)

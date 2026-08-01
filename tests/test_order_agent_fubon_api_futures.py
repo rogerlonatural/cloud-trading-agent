@@ -50,6 +50,86 @@ class TestOrderBatching(unittest.TestCase):
         placed = [r for r in results if r.get("api") == "place_order"]
         self.assertTrue(all(r["success"] for r in placed))
 
+    def test_mayday_closes_fitm_positions_when_product_is_tmfh6(self):
+        """Regression: HybridPosition.symbol=FITM must close on MAYDAY TMFH6.
+
+        Live 2026-07-31: strict symbol equality skipped all FITM rows; feedback
+        was list_positions-only with success=true and no place_order.
+        """
+        agent = make_agent()
+        # Live shape from roger-fubon feedback (two long lots, accounting symbol).
+        pos1 = MagicMock(
+            symbol="FITM",
+            expiry_date="202608",
+            buy_sell=BSAction.Buy,
+            lot=1,
+        )
+        pos2 = MagicMock(
+            symbol="FITM",
+            expiry_date="202608",
+            buy_sell=BSAction.Buy,
+            lot=1,
+        )
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [],
+                [pos1, pos2],
+            )
+        )
+        agent._check_order_info = MagicMock(
+            return_value=dict(api="check_order_info", success=True, result="{}")
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+        agent.sdk.futopt.convert_symbol.return_value = "TMFH6"
+
+        results = agent._mayday_futures("TMFH6", price=43573)
+
+        self.assertEqual(agent.sdk.futopt.place_order.call_count, 2)
+        for call in agent.sdk.futopt.place_order.call_args_list:
+            order = call.args[1]
+            self.assertEqual(order.buy_sell, BSAction.Sell)
+            self.assertEqual(order.lot, 1)
+        placed = [r for r in results if r.get("api") == "place_order"]
+        self.assertEqual(len(placed), 2)
+        self.assertTrue(all(r["success"] for r in placed))
+
+    def test_mayday_closes_fitx_positions_when_product_is_txfh6(self):
+        """Same accounting→order mapping for TXF (FITX ↔ TXFH6)."""
+        agent = make_agent()
+        position = MagicMock(
+            symbol="FITX",
+            expiry_date="202608",
+            buy_sell=BSAction.Sell,
+            lot=3,
+        )
+        agent._has_open_interest = MagicMock(
+            return_value=(
+                dict(api="list_positions", success=True, result="[]"),
+                [],
+                [position],
+            )
+        )
+        agent._check_order_info = MagicMock(
+            return_value=dict(api="check_order_info", success=True, result="{}")
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+        agent.sdk.futopt.convert_symbol.return_value = "TXFH6"
+
+        results = agent._mayday_futures("TXFH6")
+
+        self.assertEqual(agent.sdk.futopt.place_order.call_count, 1)
+        order = agent.sdk.futopt.place_order.call_args.args[1]
+        # Short → close with Buy
+        self.assertEqual(order.buy_sell, BSAction.Buy)
+        self.assertEqual(order.lot, 3)
+        placed = [r for r in results if r.get("api") == "place_order"]
+        self.assertEqual(len(placed), 1)
+
     def test_place_order_passes_contract_symbol_through(self):
         # convert_symbol needs accounting_sym+expiry; full order codes pass through.
         agent = make_agent()
