@@ -258,16 +258,36 @@ def _register_command(command_id: str) -> bool:
 
 
 def _send_agent_feedback(payload, command_id=""):
+    """POST execution result to slash-futures feedback CF.
+
+    Expected 204. 4xx is usually permanent (e.g. FuturesBot never logged the
+    command_id — live 2026-08-05: MySQL command_id VARCHAR overflow for long
+    agent names like roger_fubon) so we fail fast instead of holding the order
+    lock for ~15s of useless retries.
+    """
     retry = 0
     status_code = None
     response_text = None
+    headers = {"Content-Type": "application/json"}
     while True:
         try:
-            response = requests.post(FEEDBACK_URL, data=json.dumps(payload))
+            response = requests.post(
+                FEEDBACK_URL,
+                data=json.dumps(payload),
+                headers=headers,
+                timeout=15,
+            )
             status_code = response.status_code
             response_text = response.text
             if status_code == 204:
                 logger.info("[%s] Feedback sent OK" % command_id)
+                return
+            # Permanent client errors: do not burn order-lock time retrying.
+            if 400 <= status_code < 500:
+                logger.info(
+                    "[%s] Failed to feedback (no retry) %s %s"
+                    % (command_id, status_code, response_text)
+                )
                 return
         except Exception:
             logger.info(

@@ -54,6 +54,8 @@ class TestSessionAliveAndEnsureLoggedIn(unittest.TestCase):
         agent._connected = False
         agent._login_at = 0.0
         agent._reconnect_lock = __import__("threading").Lock()
+        agent._session_transition = False
+        agent._logout_at = 0.0
         agent.agent_account_mapping = {"test-agent": "28"}
         agent.agent_id = None
         agent.trace_id = "test-trace"
@@ -181,6 +183,42 @@ class TestSessionAliveAndEnsureLoggedIn(unittest.TestCase):
             mock_login.side_effect = after_login
             agent.reconnect()
             mock_set.assert_called_once_with("test-agent")
+
+    def test_late_manual_disconnect_302_does_not_kill_fresh_session(self):
+        """Regression 2026-08-05: logout 302 arrived after Login succeed."""
+        agent = self._make_agent()
+        agent._connected = True
+        agent._login_at = time.time()
+        agent._session_transition = False
+        agent._logout_at = time.time()  # just logged out/reconnected
+
+        agent._on_event("302", "manual disconnect")
+
+        self.assertTrue(
+            agent._connected,
+            "late 302 after intentional logout must not mark session dead",
+        )
+
+    def test_real_disconnect_300_still_marks_dead(self):
+        agent = self._make_agent()
+        agent._connected = True
+        agent._login_at = time.time()
+        agent._session_transition = False
+        agent._logout_at = 0.0
+
+        agent._on_event("300", "disconnect")
+
+        self.assertFalse(agent._connected)
+
+    def test_disconnect_during_session_transition_ignored(self):
+        agent = self._make_agent()
+        agent._connected = True
+        agent._session_transition = True
+        agent._logout_at = time.time()
+
+        agent._on_event("300", "disconnect")
+
+        self.assertTrue(agent._connected)
 
 
 if __name__ == "__main__":

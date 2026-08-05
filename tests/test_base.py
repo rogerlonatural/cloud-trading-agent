@@ -197,6 +197,23 @@ class TestSdkModelLogging(unittest.TestCase):
         self.assertEqual(exec_result["stock_no"], "2501")
         self.assertEqual(exec_result["buy_sell"], "Sell")
 
+    @patch("fubon_agent.api.base.requests.post")
+    def test_feedback_400_does_not_retry(self, mock_post):
+        """Permanent 4xx (e.g. missing FuturesBot row) must not hold the lock."""
+        mock_post.return_value.status_code = 400
+        mock_post.return_value.text = "BAD REQUEST"
+        feedback_execution_result(
+            "agent-1",
+            AgentCommand.CLOSE_AND_SELL,
+            "TXF 1.3.2m-MXFH6-small-roger_fubon-1785942007446",
+            {"success": True, "results": []},
+        )
+        mock_post.assert_called_once()
+        self.assertIn(
+            "application/json",
+            mock_post.call_args.kwargs.get("headers", {}).get("Content-Type", ""),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

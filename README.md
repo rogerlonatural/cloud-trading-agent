@@ -60,9 +60,12 @@ Key behaviors in `fubon_api.py`:
 - **Rate limiting**: Fubon caps accounting/position queries at 5 req/s — all
   `sdk.accounting`/`sdk.futopt` query calls go through a shared
   `RateLimiter` to avoid tripping this.
-- **Margin check**: proactively calls `query_estimate_margin()` before
-  placing an order (Fubon has no confirmed fine-grained "insufficient
-  margin" status code, unlike Shioaji's `99Q9`/`99QB`).
+- **Margin check**: before limit orders, compares
+  `query_estimate_margin().estimate_margin` to
+  `query_margin_equity().available_margin` using the real side/price
+  (Fubon has no `is_sufficient` flag and no confirmed fine-grained
+  "insufficient margin" status code, unlike Shioaji's `99Q9`/`99QB`).
+  Query failures proceed rather than false-blocking.
 
 See `fubon_agent/api/fubon_api.py` for inline notes on which parts of the
 Fubon SDK surface are directly confirmed by [Fubon's docs](https://www.fbs.com.tw/TradeAPI/llms.txt)

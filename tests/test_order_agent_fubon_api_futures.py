@@ -1,6 +1,7 @@
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import fubon_agent.api.fubon_api as fubon_api_module
@@ -213,6 +214,45 @@ class TestOrderBatching(unittest.TestCase):
 
         self.assertTrue(response["success"])
         agent.sdk.futopt.place_order.assert_not_called()
+
+    def test_place_order_limit_blocks_when_available_margin_below_estimate(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimate_margin=100000),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(available_margin=50000),
+        )
+
+        with self.assertRaises(NotEnoughMoneyError) as ctx:
+            agent._place_order("TMFH6", "S", price=44214, qty=1)
+
+        self.assertIn("qty=1", str(ctx.exception))
+        agent.sdk.futopt.place_order.assert_not_called()
+
+    def test_place_order_limit_proceeds_when_available_covers_estimate(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimate_margin=30000),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(available_margin=210000),
+        )
+        agent.sdk.futopt.place_order.return_value = MagicMock(
+            order_no="ord-1", status="10"
+        )
+
+        response = agent._place_order("TMFH6", "S", price=44214, qty=3)
+
+        self.assertTrue(response["success"])
+        order = agent.sdk.futopt.place_order.call_args.args[1]
+        self.assertEqual(order.buy_sell, BSAction.Sell)
+        self.assertEqual(order.lot, 3)
+        self.assertEqual(order.price, "44214")
 
     def test_has_open_interest_also_checks_txf_for_mxf(self):
         agent = make_agent()
@@ -476,6 +516,122 @@ class TestPriceChasingRetry(unittest.TestCase):
 
         self.assertEqual(qtys_seen, [3, 2, 1])
         self.assertTrue(result[-1]["success"])
+
+
+class TestMarginPreCheck(unittest.TestCase):
+    """query_estimate_margin has no is_sufficient; compare vs available_margin.
+
+    Regression: 2026-08-05 CLOSE_AND_SELL TMFH6 treated is_success=False as
+    insufficient margin despite ~210k available.
+    """
+
+    def test_estimate_query_failure_proceeds(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=False, message="查無任何資料", data=None
+        )
+
+        self.assertTrue(
+            agent._check_margin_sufficient("TMFH6", 1, buy_sell="S", price=44214)
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.assert_not_called()
+
+    def test_equity_query_failure_proceeds(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True, data=MagicMock(estimate_margin=30000)
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=False, message="timeout", data=None
+        )
+
+        self.assertTrue(
+            agent._check_margin_sufficient("TMFH6", 1, buy_sell="S", price=44214)
+        )
+
+    def test_missing_estimate_margin_proceeds(self):
+        agent = make_agent()
+        # Official fields only; no is_sufficient. Missing estimate → proceed.
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(date="2024/01/01", currency="TWD"),
+        )
+
+        self.assertTrue(
+            agent._check_margin_sufficient("TMFH6", 1, buy_sell="S", price=44214)
+        )
+
+    def test_available_below_estimate_is_insufficient(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimate_margin=100000),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(available_margin=50000),
+        )
+
+        self.assertFalse(
+            agent._check_margin_sufficient("TMFH6", 3, buy_sell="S", price=44214)
+        )
+
+    def test_available_covers_estimate_is_sufficient(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimate_margin=30000),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(available_margin=210000),
+        )
+
+        self.assertTrue(
+            agent._check_margin_sufficient("TMFH6", 3, buy_sell="S", price=44214)
+        )
+
+    def test_uses_actual_side_and_limit_price_for_estimate_order(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimate_margin=1),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(available_margin=999999),
+        )
+
+        agent._check_margin_sufficient("TMFH6", 3, buy_sell="S", price=44214)
+
+        order = agent.sdk.futopt.query_estimate_margin.call_args.args[1]
+        self.assertEqual(order.buy_sell, BSAction.Sell)
+        self.assertEqual(order.symbol, "TMFH6")
+        self.assertEqual(order.price, "44214")
+        self.assertEqual(order.lot, 3)
+
+    def test_camel_case_field_aliases(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(estimateMargin=40000),
+        )
+        agent.sdk.futopt_accounting.query_margin_equity.return_value = MagicMock(
+            is_success=True,
+            data=SimpleNamespace(availableMargin=10000),
+        )
+
+        self.assertFalse(
+            agent._check_margin_sufficient("TMFH6", 1, buy_sell="S", price=1)
+        )
+
+    def test_exception_proceeds(self):
+        agent = make_agent()
+        agent.sdk.futopt.query_estimate_margin.side_effect = RuntimeError("sdk boom")
+
+        self.assertTrue(
+            agent._check_margin_sufficient("TMFH6", 1, buy_sell="S", price=44214)
+        )
 
 
 class TestLoginMethod(unittest.TestCase):

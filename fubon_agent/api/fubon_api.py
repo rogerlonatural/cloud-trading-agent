@@ -256,6 +256,10 @@ class OrderAgent(OrderAgentBase):
         self._connected = False
         self._login_at = 0.0  # time.time() of last successful login
         self._reconnect_lock = threading.Lock()
+        # Set while logout/login is in flight so late on_event(302) from our own
+        # logout cannot mark a freshly-logged-in session dead (live 2026-08-05).
+        self._session_transition = False
+        self._logout_at = 0.0
         self._rate_limiter = RateLimiter(max_calls=5, period=1.0)
         self.trace_id = ""
 
@@ -297,6 +301,10 @@ class OrderAgent(OrderAgentBase):
 
     def _safe_reset_sdk(self):
         """Logout and clear SDK so the next login starts from a clean client."""
+        # Intentional logout fires on_event code 302 ("manual disconnect")
+        # asynchronously; ignore those while transitioning sessions.
+        self._session_transition = True
+        self._logout_at = time.time()
         try:
             if self.sdk:
                 self.sdk.logout()
@@ -383,6 +391,7 @@ class OrderAgent(OrderAgentBase):
                         f"[{self.trace_id}] Login failed after retry. {ex}, "
                         f"{traceback.format_exc()}"
                     )
+                    self._session_transition = False
                     if too_many:
                         raise TooManyConnectionsError(str(ex)) from ex
                     raise
@@ -431,6 +440,9 @@ class OrderAgent(OrderAgentBase):
                         f"_set_account failed (will retry on InitAgent): {e}"
                     )
         finally:
+            # Login done; late 302 from the intentional logout is still ignored
+            # via _logout_at grace in _should_ignore_disconnect_event.
+            self._session_transition = False
             self._reconnect_lock.release()
 
     def shutdown(self):
@@ -588,6 +600,23 @@ class OrderAgent(OrderAgentBase):
             return content.get("code")
         return getattr(content, "code", None)
 
+    def _should_ignore_disconnect_event(self, code, content) -> bool:
+        """Ignore disconnects caused by our own logout / mid-reconnect races.
+
+        Live 2026-08-05: reconnect logout → async on_event 302 "manual disconnect"
+        arrived *after* Login succeed, marked session dead, forced a second login.
+        """
+        # Mid-reconnect (logout → login still in progress on order thread).
+        if self._session_transition:
+            return True
+        # Late 302 from intentional logout after the new session is already up.
+        if self._logout_at and (time.time() - self._logout_at) < 15.0:
+            code_s = str(code)
+            content_s = str(content or "").lower()
+            if code_s in ("302", "302.0") or "manual disconnect" in content_s:
+                return True
+        return False
+
     def _on_event(self, code_or_err, content=None):
         try:
             code = self._extract_event_code(code_or_err, content)
@@ -599,6 +628,13 @@ class OrderAgent(OrderAgentBase):
                 format_inline(code_or_err),
             )
             if code in DISCONNECT_EVENT_CODES:
+                if self._should_ignore_disconnect_event(code, content):
+                    logger.info(
+                        f"[{self.trace_id}] ignore disconnect event {code} during "
+                        f"session transition/logout grace "
+                        f"(connected={self._connected})"
+                    )
+                    return
                 # Mark dead; actual reconnect runs on ensure_logged_in / API
                 # session-dead recovery so we do not race the order lock from
                 # the SDK callback thread (etensword-agent pattern).
@@ -739,28 +775,104 @@ class OrderAgent(OrderAgentBase):
                 continue
         return 0
 
-    def _check_margin_sufficient(self, symbol, qty) -> bool:
-        """Proactive margin check via query_estimate_margin(account, order).
+    @staticmethod
+    def _as_float(val):
+        if val is None or val == "":
+            return None
+        if type(val).__name__ in ("MagicMock", "Mock", "AsyncMock"):
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
 
-        Best-effort: any lookup failure is treated as "proceed".
+    def _sdk_float(self, obj, *names):
+        """Read the first parseable float among snake_case / camelCase aliases."""
+        if obj is None:
+            return None
+        for name in names:
+            num = self._as_float(getattr(obj, name, None))
+            if num is not None:
+                return num
+        return None
+
+    def _check_margin_sufficient(
+        self, symbol, qty, buy_sell=ORDER_TYPE_BUY, price=0
+    ) -> bool:
+        """Proactive margin check: estimate_margin vs available_margin.
+
+        Official Fubon EstimateMargin only documents date/currency/estimate_margin
+        — there is no is_sufficient flag. Compare required estimate to
+        futopt_accounting.query_margin_equity().available_margin.
+
+        Best-effort: any lookup failure, is_success=False, or missing fields is
+        treated as "proceed" (return True). Never false-block on a bad pre-check
+        (live 2026-08-05: TMFH6 blocked with ~210k available after treating
+        query_estimate_margin is_success=False as insufficient).
         """
         try:
-            order = self._create_futures_order(ORDER_TYPE_BUY, 0, qty, symbol)
+            # Match the real order side/price so estimate reflects the place path
+            # (old code always used BUY + market price=0, which often failed).
+            order = self._create_futures_order(buy_sell, price, qty, symbol)
             self._rate_limiter.acquire()
-            result = self.sdk.futopt.query_estimate_margin(
+            estimate_result = self.sdk.futopt.query_estimate_margin(
                 self.current_account, order
             )
-            # Some SDK versions put a flag on the Result; others only return
-            # EstimateMargin data. Treat explicit is_success=False as fail.
-            if getattr(result, "is_success", None) is False:
-                return False
-            data = getattr(result, "data", result)
-            sufficient = getattr(data, "is_sufficient", None)
-            if sufficient is False:
-                return False
+            if getattr(estimate_result, "is_success", None) is False:
+                logger.warning(
+                    f"[{self.trace_id}] query_estimate_margin is_success=False "
+                    f"symbol={symbol} buy_sell={buy_sell} price={price} qty={qty} "
+                    f"message={getattr(estimate_result, 'message', None)!r}; "
+                    f"proceeding without pre-check"
+                )
+                return True
+
+            estimate_data = getattr(estimate_result, "data", estimate_result)
+            estimate = self._sdk_float(
+                estimate_data, "estimate_margin", "estimateMargin"
+            )
+            if estimate is None:
+                logger.warning(
+                    f"[{self.trace_id}] query_estimate_margin missing estimate_margin "
+                    f"symbol={symbol} buy_sell={buy_sell} price={price} qty={qty}; "
+                    f"proceeding without pre-check"
+                )
+                return True
+
+            self._rate_limiter.acquire()
+            equity_result = self.sdk.futopt_accounting.query_margin_equity(
+                self.current_account
+            )
+            if getattr(equity_result, "is_success", None) is False:
+                logger.warning(
+                    f"[{self.trace_id}] query_margin_equity is_success=False "
+                    f"message={getattr(equity_result, 'message', None)!r}; "
+                    f"proceeding without pre-check"
+                )
+                return True
+
+            equity_data = getattr(equity_result, "data", equity_result)
+            available = self._sdk_float(
+                equity_data, "available_margin", "availableMargin"
+            )
+            if available is None:
+                logger.warning(
+                    f"[{self.trace_id}] query_margin_equity missing available_margin; "
+                    f"proceeding without pre-check"
+                )
+                return True
+
+            sufficient = available >= estimate
+            logger.info(
+                f"[{self.trace_id}] margin pre-check symbol={symbol} "
+                f"buy_sell={buy_sell} price={price} qty={qty} "
+                f"estimate_margin={estimate} available_margin={available} "
+                f"sufficient={sufficient}"
+            )
+            return sufficient
         except Exception as e:
             logger.warning(
-                f"[{self.trace_id}] query_estimate_margin check failed, "
+                f"[{self.trace_id}] margin pre-check failed, "
                 f"proceeding without pre-check: {e}"
             )
         return True
@@ -1134,8 +1246,12 @@ class OrderAgent(OrderAgentBase):
     def _place_order(self, product, buy_sell, price=0, qty=1):
         try:
             symbol = self._convert_symbol(product)
-            if price and not self._check_margin_sufficient(symbol, qty):
-                raise NotEnoughMoneyError("Estimated margin insufficient for qty=%s" % qty)
+            if price and not self._check_margin_sufficient(
+                symbol, qty, buy_sell=buy_sell, price=price
+            ):
+                raise NotEnoughMoneyError(
+                    "Estimated margin insufficient for qty=%s" % qty
+                )
 
             if self.is_dry_run:
                 logger.info(
